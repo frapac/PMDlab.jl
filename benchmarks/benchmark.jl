@@ -20,7 +20,8 @@ struct ThreeWire end
 struct FourWire end
 
 const PMD = PowerModelsDistribution
-const DATA_DIR = joinpath(@__DIR__, "data")
+const DATA_DIR = joinpath(@__DIR__, "..", "data")
+const RESULTS_DIR = joinpath(@__DIR__, "..", "results")
 
 PowerModelsDistribution.silence!()
 
@@ -74,7 +75,9 @@ end
 function scan_instances(data_dir)
     instances = Tuple{String, String}[]
     for network in readdir(data_dir)
+        !isdir(joinpath(data_dir, network)) && continue
         for feeder in readdir(joinpath(data_dir, network))
+            !isdir(joinpath(data_dir, network, feeder)) && continue
             push!(instances, (network, feeder))
         end
     end
@@ -83,53 +86,15 @@ end
 
 function import_data(instance, ::ThreeWire)
     eng3w = parse_file(instance, transformations=[transform_loops!])
-    eng3w["settings"]["sbase_default"] = 1
-    eng3w["voltage_source"]["source"]["rs"] *= 0  # remove voltage source internal impedance
-    eng3w["voltage_source"]["source"]["xs"] *= 0  # remove voltage source internal impedance
-
-    math3w = transform_data_model(eng3w, kron_reduce=true, phase_project=false)
-
-    ref_bus = [i for (i,bus) in math3w["bus"] if occursin("source", bus["name"])]
-    math3w["bus"]["$(ref_bus[1])"]["vmin"] *= 0.98
-    math3w["bus"]["$(ref_bus[1])"]["vmax"] *= 1.02
-
-    ### changing some of the input data
-    for (i,bus) in math3w["bus"]
-        if bus["bus_type"] != 3 && !startswith(bus["source_id"], "transformer")
-            bus["vm_pair_lb"] = [(1, 4, 0.9);(2, 4, 0.9);(3, 4, 0.9)]
-            bus["vm_pair_ub"] = [(1, 4, 1.1);(2, 4, 1.1);(3, 4, 1.1)]
-            # bus["grounded"] .=  0
-        end
-    end
-
-    for (g,gen) in math3w["gen"]
-        gen["cost"] = 1000 .* gen["cost"]
-    end
-
-    gen_counter = length(math3w["gen"])
-    for (d, load) in math3w["load"]
-        if mod(load["index"], 4) == 1
-            gen_counter = gen_counter + 1
-            math3w["gen"]["$gen_counter"] = deepcopy(math3w["gen"]["1"])
-            math3w["gen"]["$gen_counter"]["name"] = "$gen_counter"
-            math3w["gen"]["$gen_counter"]["index"] = gen_counter
-            math3w["gen"]["$gen_counter"]["cost"] = 0.5*math3w["gen"]["1"]["cost"]
-            math3w["gen"]["$gen_counter"]["gen_bus"] = load["load_bus"]
-            math3w["gen"]["$gen_counter"]["pmax"] = 4*ones(3)
-            math3w["gen"]["$gen_counter"]["pmin"] = 0.0*ones(3)
-            math3w["gen"]["$gen_counter"]["connections"] = [1;2;3]
-        end
-        ### change every 10th load to constant impedance
-        if mod(load["index"], 10) == 1
-            load["model"] = IMPEDANCE
-        end
-    end
-    data_math = transform_data_model(
+    PMDlab.augment_eng_3wire!(eng3w; line_current_rating=true, reduce_lines=true, sbase=1)
+    math3w = transform_data_model(eng3w, kron_reduce=true, phase_project=true)
+    PMDlab.augment_math_3wire!(math3w; relax_vsource_vm=true, Vsequence_bounds=true, cost_multiplier=1000)  # changing some of the input data
+    return transform_data_model(
         math3w;
     )
-    return data_math
 end
 
+# TODO: FourWire has not been updated yet
 function import_data(instance, ::FourWire)
     eng4w = parse_file(instance, transformations=[transform_loops!])
     eng4w["settings"]["sbase_default"] = 1
@@ -350,9 +315,14 @@ function run_benchmark(solver, instances, formulation, wire)
     return [c1 c2 results]
 end
 
-@main function main(; solver="ipopt", form="acp", nwire="3-wire")
+Comonicon.@main function main(; solver="ipopt", transformer=false, form="acp", nwire="3-wire")
     if nwire == "3-wire"
-        instances = scan_instances(joinpath(DATA_DIR, "three-wire"))
+        instances = if transformer
+            scan_instances(joinpath(DATA_DIR, "three-wire-with-transformer"))
+        else
+            scan_instances(joinpath(DATA_DIR, "three-wire"))
+        end
+        println(instances)
         formulation = if form == "acp"
             ACPUPowerModel
         elseif form == "acr"
@@ -372,19 +342,19 @@ end
 
     if solver == "ipopt"
         results = run_benchmark(solve_ipopt, instances, formulation, wire)
-        dump_file = joinpath(@__DIR__, "results", "ipopt_ma27_$(nw)w_$(form).txt")
+        dump_file = joinpath(RESULTS_DIR, "ipopt_ma27_$(nw)w_$(form).txt")
     elseif solver == "knitro"
         results = run_benchmark(solve_knitro, instances, formulation, wire)
-        dump_file = joinpath(@__DIR__, "results", "knitro_ma27_$(nw)w_$(form).txt")
+        dump_file = joinpath(RESULTS_DIR, "knitro_ma27_$(nw)w_$(form).txt")
     elseif solver == "exaknitro"
         results = run_benchmark(solve_exa_knitro, instances, formulation, wire)
-        dump_file = joinpath(@__DIR__, "results", "exaknitro_ma27_$(nw)w_$(form).txt")
+        dump_file = joinpath(RESULTS_DIR, "exaknitro_ma27_$(nw)w_$(form).txt")
     elseif solver == "madnlp"
         results = run_benchmark(solve_madnlp, instances, formulation, wire)
-        dump_file = joinpath(@__DIR__, "results", "madnlp_ma27_$(nw)w_$(form).txt")
+        dump_file = joinpath(RESULTS_DIR, "madnlp_ma27_$(nw)w_$(form).txt")
     elseif solver == "examadnlp"
         results = run_benchmark(solve_exa_madnlp, instances, formulation, wire)
-        dump_file = joinpath(@__DIR__, "results", "examadnlp_ma27_$(nw)w_$(form).txt")
+        dump_file = joinpath(RESULTS_DIR, "examadnlp_ma27_$(nw)w_$(form).txt")
     end
     writedlm(dump_file, results)
 end
